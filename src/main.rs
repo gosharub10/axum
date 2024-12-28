@@ -74,7 +74,10 @@ async fn main() -> Result<(), Errors>{
                     get(get_all).
                     post(create)
                 )
-        .route("/users/:id", get(get_user))
+        .route("/users/:id", 
+                    get(get_user).
+                    delete(delete)
+                )
         .route("/health_check", get(health_check))
         .with_state(app_state?)
         .layer(
@@ -179,4 +182,18 @@ async fn get_user(State(db): State<AppState>, Path(id): Path<i32>) -> Result<imp
     Ok(Json(user))
 }
 
+async fn delete(State(db): State<AppState>, Path(id): Path<i32>) -> Result<StatusCode, (StatusCode, impl IntoResponse)>{
+    sqlx::query("DELETE FROM users WHERE user_id = $1")
+    .bind(id)
+    .execute(&*db.db)
+    .await
+    .map_err(|e|{
+        (
+            StatusCode::NOT_FOUND,
+            format!("{}", Errors::from(e))
+        )
+    })?;
+
+    Ok(StatusCode::OK)
+}
 //TODO сделать простейшие CRUD для работы с базой данных
