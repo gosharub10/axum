@@ -31,13 +31,27 @@ impl AppState {
 
 #[derive(Serialize, Deserialize, FromRow)]
 struct User{
+    #[sqlx(rename = "user_name")]
     name : String,
+
+    #[sqlx(rename = "user_email")]
     email: String,
+
+    #[sqlx(rename = "user_password")]
     password: String,
+
+    #[sqlx(rename = "user_phone")]
     phone: String,
+
+    #[sqlx(rename = "user_address")]
     address: String
 }
 
+impl IntoResponse for User {
+    fn into_response(self) -> Response {
+        Json(self).into_response()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Errors>{
@@ -56,7 +70,10 @@ async fn main() -> Result<(), Errors>{
     let app_state = AppState::new(&database_url?).await.map_err(|e| Errors::from(e));
 
     let app = Router::new()
-        .route("/users", get(get_all))
+        .route("/users", 
+                    get(get_all).
+                    post(create)
+                )
         .route("/health_check", get(health_check))
         .with_state(app_state?)
         .layer(
@@ -125,6 +142,25 @@ async fn get_all(State(db): State<AppState>) -> Result<impl IntoResponse ,(Statu
     })?;
 
     Ok(Json(users))
+}
+
+async fn create(State(db): State<AppState>, Json(new_user): Json<User>) -> Result<StatusCode, (StatusCode, impl IntoResponse)>{
+    sqlx::query("INSERT INTO users (user_name, user_email, user_password, user_phone, user_address) VALUES ($1,$2,$3,$4,$5)")
+    .bind(new_user.name)
+    .bind(new_user.email)
+    .bind(new_user.password)
+    .bind(new_user.phone)
+    .bind(new_user.address)
+    .execute(&*db.db)
+    .await
+    .map_err(|e|{
+        (
+            StatusCode::BAD_REQUEST,
+            format!("{}", Errors::from(e))
+        )
+    })?;
+
+    Ok(StatusCode::CREATED)
 }
 
 //TODO сделать простейшие CRUD для работы с базой данных
