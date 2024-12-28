@@ -1,14 +1,11 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{clone, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
-    body::Bytes,
-    extract::{MatchedPath, Path, State},
-    http::{HeaderMap, Request, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
-    Json, Router,
+    body::{Body, Bytes}, extract::{MatchedPath, Path, State}, http::{header, HeaderMap, Request, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}, Extension, Json, Router
 };
+use chrono::Utc;
 use error::Errors;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{prelude::FromRow, PgPool};
@@ -100,8 +97,10 @@ async fn main() -> Result<(), Errors> {
         .map_err(|e| Errors::from(e));
 
     let app = Router::new()
+        .route("/login", post(login))
         .route("/users", get(get_all).post(create))
         .route("/users/:id", get(get_user).delete(delete).patch(update))
+        .route("/secret", get(protected).route_layer(middleware::from_fn_with_state(app_state.clone()?, check_auth)))
         .route("/health_check", get(health_check))
         .with_state(app_state?)
         .layer(
@@ -283,6 +282,94 @@ async fn update(
                 Json(json!({"error": "Failed to update user"}))
             )
         })?;
+
+    Ok(Json(user))
+}
+
+
+//middleware auth user for special routes
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct Claims{
+    email: String,
+    exp: i64
+}
+
+//function fot creating a jwt-token
+fn create_token(user_email: String) -> Result<String, jsonwebtoken::errors::Error>{
+    encode(
+        &Header::default(),
+        &Claims{
+            email: user_email,
+            exp: (Utc::now() + chrono::Duration::minutes(1)).timestamp()
+        }, 
+        &EncodingKey::from_secret("secret".as_bytes())
+    )
+}
+
+async fn check_auth(State(db): State<AppState>, mut req: Request<Body>, next: Next) -> Result<Response,StatusCode>{
+    //extract token from header
+    let header_auth = req.headers()
+                                        .get(header::AUTHORIZATION)
+                                        .and_then(|auth| auth.to_str().ok());
+
+    //check for token in header
+    let token = header_auth
+                            .and_then(|header| header.strip_prefix("Bearer "))
+                            .ok_or(StatusCode::UNAUTHORIZED)?;
+    
+    //validate token
+    let token_data: TokenData<Claims> = decode(token, &DecodingKey::from_secret("secret".as_bytes()), &Validation::default()).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    let user_email = token_data.claims.email.clone();
+    let user= sqlx::query_as::<_, User>("SELECT * FROM users WHERE user_email = $1")
+        .bind(&user_email)
+        .fetch_optional(&*db.db)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    req.extensions_mut().insert(token_data.claims);
+
+    Ok(next.run(req).await)
+}
+
+//route for login 
+#[derive(Debug, Deserialize)]
+struct LoginUser{
+    email: String,
+    password:String
+}
+
+async fn login(State(db): State<AppState>, Json(user_login): Json<LoginUser>) -> Result<String, StatusCode>{
+    let user = sqlx::query_as::<_,User>("SELECT * FROM users WHERE user_email = $1 AND user_password = $2")
+    .bind(user_login.email)
+    .bind(user_login.password)
+    .fetch_optional(&*db.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let token = create_token(user.email.to_string())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(json!({"token": token})).to_string())
+}
+
+async fn protected(  
+    claims: Option<Extension<Claims>>,
+    State(db): State<AppState>
+) -> Result<Json<User>, StatusCode> {
+    let claims = claims.ok_or(StatusCode::UNAUTHORIZED)?;
+    
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE user_email = $1")
+        .bind(claims.email.parse::<String>().map_err(|_| StatusCode::BAD_REQUEST)?)
+        .fetch_optional(&*db.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(user))
 }
