@@ -1,14 +1,24 @@
 use std::{env::VarError, error::Error, fmt::Display};
 
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::Serialize;
 use serde_json::json;
 
-#[derive(Debug, Serialize,Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub enum Errors {
     IO(String),
     Axum(String),
     Sqlx(String),
-    Env(String)
+    Env(String),
+}
+
+impl IntoResponse for Errors {
+    fn into_response(self) -> Response {
+        Json(self).into_response()
+    }
 }
 
 impl From<VarError> for Errors {
@@ -48,12 +58,12 @@ impl Display for Errors {
             }
             Errors::Sqlx(error) => {
                 let json_string = json!({"error": error}).to_string();
-                write!(f,"{}", json_string)
-            },
+                write!(f, "{}", json_string)
+            }
             Errors::Env(error) => {
                 let json_string = json!({"error": error}).to_string();
-                write!(f,"{}", json_string)
-            },
+                write!(f, "{}", json_string)
+            }
         }
     }
 }
