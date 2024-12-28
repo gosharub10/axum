@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use axum::{body::Bytes, extract::{MatchedPath, State}, http::{HeaderMap, Request, StatusCode}, response::{IntoResponse, Response}, routing::get, Json, Router};
+use axum::{body::Bytes, extract::{MatchedPath, Path, State}, http::{HeaderMap, Request, StatusCode}, response::{IntoResponse, Response}, routing::get, Json, Router};
 use error::Errors;
 use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, PgPool};
@@ -74,6 +74,7 @@ async fn main() -> Result<(), Errors>{
                     get(get_all).
                     post(create)
                 )
+        .route("/users/:id", get(get_user))
         .route("/health_check", get(health_check))
         .with_state(app_state?)
         .layer(
@@ -161,6 +162,21 @@ async fn create(State(db): State<AppState>, Json(new_user): Json<User>) -> Resul
     })?;
 
     Ok(StatusCode::CREATED)
+}
+
+async fn get_user(State(db): State<AppState>, Path(id): Path<i32>) -> Result<impl IntoResponse, (StatusCode, impl IntoResponse)>{
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE user_id = $1")
+    .bind(id)
+    .fetch_one(&*db.db)
+    .await
+    .map_err(|e|{
+        (
+            StatusCode::NOT_FOUND,
+            format!("{}", Errors::from(e))
+        )
+    })?;
+    
+    Ok(Json(user))
 }
 
 //TODO сделать простейшие CRUD для работы с базой данных
