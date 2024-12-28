@@ -1,11 +1,13 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{body::Bytes, extract::{MatchedPath, State}, http::{HeaderMap, Request, StatusCode}, response::{IntoResponse, Response}, routing::get, Json, Router};
 use error::Errors;
 use serde::{Deserialize, Serialize};
 use sqlx::{prelude::FromRow, PgPool};
-use tracing::{info, Level};
-use tracing_subscriber::fmt::format;
+use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
+use tracing::{debug, error, info, info_span, Span};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuidv4::uuid;
 
 mod error;
 
@@ -41,9 +43,12 @@ struct User{
 async fn main() -> Result<(), Errors>{
     let _ = dotenv::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .event_format(format().compact())
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| { format!("{}=debug,tower_http=debug,axum::rejection=trace",
+        env!("CARGO_CRATE_NAME"))
+        .into()}),)
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     let database_url = std::env::var("DATABASE_URL").map_err(|e| Errors::from(e));
@@ -53,13 +58,44 @@ async fn main() -> Result<(), Errors>{
     let app = Router::new()
         .route("/users", get(get_all))
         .route("/health_check", get(health_check))
-        .with_state(app_state?);
+        .with_state(app_state?)
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| {
+                    let matched_path = request.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
+                    info_span!(
+                        "http_request",
+                        method = ?request.method(),
+                        matched_path,
+                        some_other_field = tracing::field::Empty,
+                    )
+                })
+                .on_request(|request: &Request<_>, span: &Span| {
+                    let request_id = uuid::v4();
+                    span.record("request_id", &request_id.to_string());
+                    info!("Received request: {:?}", request);
+                })
+                .on_response(|response: &Response, latency: Duration, span: &Span| {
+                    span.record("status", &response.status().as_u16());
+                    info!("Response sent with status: {} in {:?}", response.status(), latency);
+                })
+                .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                    span.record("chunk_size", &chunk.len());
+                    debug!("Chunk of size {} received in {:?}", chunk.len(), latency);
+                })
+                .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, _span: &Span| {
+                    info!("End of stream reached after {:?}", stream_duration);
+                })
+                .on_failure(|_error: ServerErrorsFailureClass, latency: Duration, _span: &Span| {
+                    error!("Request failed after {:?}", latency);
+                }),
+        );
 
     let addr = SocketAddr::from(([0,0,0,0], 3000));
 
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listner) => {
-            info!("Server start on: http://0.0.0.0:3000");
+            info!("Server start on: {}", listner.local_addr().unwrap());
             if let Err(err) = axum::serve(listner, app).await {
                 tracing::error!("{}", Errors::from(err))
             }
